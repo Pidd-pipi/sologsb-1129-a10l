@@ -5,8 +5,10 @@ import type { DefectSeverity, DefectType } from '../types/defect';
 import type { MatrixAvailability, MatrixFont, MatrixMaterial, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofRecord } from '../types/proof';
+import type { ProofStandard } from '../types/proofStandard';
 import { matrixIdsOf } from '../utils/layout';
 import { suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
+import { evaluateProof, standardsMap } from '../utils/proofJudge';
 
 export const DB_NAME = 'gbmovabletype-db';
 
@@ -15,12 +17,14 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 加 standards（试印工艺标准）表；旧试印按试印日期匹配当时标准补判，找不到标「未定标」
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
   cases!: Table<TypeCase, string>;
   defects!: Table<DefectLog, string>;
   proofs!: Table<ProofRecord, string>;
+  standards!: Table<ProofStandard, string>;
 
   constructor() {
     super(DB_NAME);
@@ -75,6 +79,43 @@ class MovableTypeDb extends Dexie {
             operator: '系统迁移',
             note: '由 v2 → v3 升级自动回填',
             createdAt: new Date().toISOString(),
+          });
+        }
+      });
+    this.version(4)
+      .stores({
+        matrices: 'id, code, character, font, sizeName, material, availability',
+        cases: 'id, code, kind, workStation, *matrixId',
+        defects: 'id, matrixId, defectType, severity, availability, foundDate',
+        proofs: 'id, matrixId, sampleNo, clarity, proofDate, verdict, archived',
+        standards: 'id, &[font+sizeName], version',
+      })
+      .upgrade(async (tx) => {
+        // v4：标准为全新表，老库没有数据，先写入与首装一致的内置标准
+        const stdTable = tx.table<ProofStandard, string>('standards');
+        if ((await stdTable.count()) === 0) {
+          const now = new Date().toISOString();
+          await stdTable.bulkAdd(buildDefaultStandards(now));
+        }
+        // 旧试印按试印日期匹配「当时标准」补判；未命中（整盘试印 / 该字体字号无标准）标未定标
+        const standards: ProofStandard[] = await stdTable.toArray();
+        const matrices: TypeMatrix[] = await tx.table('matrices').toArray();
+        const matrixById = new Map(matrices.map((m) => [m.id, m]));
+        const byKey = standardsMap(standards);
+        const proofTable = tx.table<ProofRecord, string>('proofs');
+        const proofs: ProofRecord[] = await proofTable.toArray();
+        for (const p of proofs) {
+          const evaluation = evaluateProof(
+            p,
+            p.matrixId ? matrixById.get(p.matrixId) : undefined,
+            byKey,
+            'migration',
+          );
+          await proofTable.update(p.id, {
+            ...toPlain(evaluation),
+            judgedAt: new Date().toISOString(),
+            archived: false,
+            archivedAt: '',
           });
         }
       });
@@ -183,9 +224,45 @@ const SEED_PROOFS: SeedProof[] = [
   { id: 'pfr-3002', targetKind: '字符', targetRef: '字', matrixId: 'm-1002', pressureKg: 10, ink: '松烟墨 08', impressions: 32, sampleNo: 'YZ-20250512-02', clarity: '偏淡', proofDate: '2025-05-12', note: '压力偏低，建议加压至 12kg' },
   { id: 'pfr-3003', targetKind: '字符', targetRef: '墨', matrixId: 'm-1011', pressureKg: 14, ink: '油烟墨 101', impressions: 25, sampleNo: 'YZ-20250513-01', clarity: '糊版', proofDate: '2025-05-13', note: '缺笔叠加糊版，判定停用' },
   { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
-  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
+  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', pressureKg: 12.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚，压力也偏高' },
   { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
 ];
+
+interface DefaultStandardSeed {
+  id: string;
+  font: MatrixFont;
+  sizeName: string;
+  pressureMinKg: number;
+  pressureMaxKg: number;
+  ink: string;
+  minImpressions: number;
+  note: string;
+}
+
+/**
+ * 内置试印工艺标准：首装与 v4 升级（老库 standards 为空时）共用同一份。
+ * 覆盖示例档案用到的字体 / 字号组合；其余组合登记标准前试印一律判「未定标」。
+ */
+const DEFAULT_STANDARDS: DefaultStandardSeed[] = [
+  { id: 'std-1001', font: '宋体', sizeName: '初号', pressureMinKg: 12, pressureMaxKg: 16, ink: '油烟墨 101', minImpressions: 30, note: '大号铜模，压力取中上限' },
+  { id: 'std-1002', font: '宋体', sizeName: '一号', pressureMinKg: 11, pressureMaxKg: 15, ink: '松烟墨 08', minImpressions: 30, note: '' },
+  { id: 'std-1003', font: '宋体', sizeName: '二号', pressureMinKg: 10, pressureMaxKg: 14, ink: '油烟墨 101', minImpressions: 25, note: '' },
+  { id: 'std-1004', font: '宋体', sizeName: '三号', pressureMinKg: 9.5, pressureMaxKg: 13.5, ink: '油烟墨 101', minImpressions: 25, note: '' },
+  { id: 'std-1005', font: '宋体', sizeName: '小四', pressureMinKg: 8.5, pressureMaxKg: 12, ink: '松烟墨 08', minImpressions: 25, note: '' },
+  { id: 'std-1006', font: '宋体', sizeName: '五号', pressureMinKg: 9, pressureMaxKg: 13, ink: '油烟墨 101', minImpressions: 30, note: '' },
+  { id: 'std-1007', font: '楷体', sizeName: '四号', pressureMinKg: 9, pressureMaxKg: 13, ink: '松烟墨 08', minImpressions: 25, note: '木活字阴干后试印' },
+  { id: 'std-1008', font: '楷体', sizeName: '二号', pressureMinKg: 10, pressureMaxKg: 14, ink: '松烟墨 08', minImpressions: 25, note: '' },
+  { id: 'std-1009', font: '仿宋', sizeName: '五号', pressureMinKg: 9, pressureMaxKg: 13, ink: '松烟墨 08', minImpressions: 30, note: '' },
+];
+
+function buildDefaultStandards(now: string): ProofStandard[] {
+  return DEFAULT_STANDARDS.map((s) => ({
+    ...s,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  }));
+}
 
 function buildSeed() {
   const now = new Date().toISOString();
@@ -232,8 +309,26 @@ function buildSeed() {
       createdAt: now,
     };
   });
-  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => ({ ...p, createdAt: now }));
-  return { matrices, cases, defects, proofs };
+  const standards = buildDefaultStandards(now);
+  const matrixById = new Map(matrices.map((m) => [m.id, m]));
+  const byKey = standardsMap(standards);
+  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => {
+    const evaluation = evaluateProof(
+      p,
+      p.matrixId ? matrixById.get(p.matrixId) : undefined,
+      byKey,
+      'live',
+    );
+    return {
+      ...p,
+      ...toPlain(evaluation),
+      archived: false,
+      archivedAt: '',
+      judgedAt: now,
+      createdAt: now,
+    };
+  });
+  return { matrices, cases, defects, standards, proofs };
 }
 
 let seedPromise: Promise<void> | null = null;
@@ -242,12 +337,21 @@ async function doSeed(): Promise<void> {
   const count = await db.matrices.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.matrices, db.cases, db.defects, db.proofs, async () => {
-    await db.matrices.bulkPut(seed.matrices);
-    await db.cases.bulkPut(seed.cases);
-    await db.defects.bulkPut(seed.defects);
-    await db.proofs.bulkPut(seed.proofs);
-  });
+  await db.transaction(
+    'rw',
+    db.matrices,
+    db.cases,
+    db.defects,
+    db.proofs,
+    db.standards,
+    async () => {
+      await db.matrices.bulkPut(seed.matrices);
+      await db.cases.bulkPut(seed.cases);
+      await db.defects.bulkPut(seed.defects);
+      await db.standards.bulkPut(seed.standards);
+      await db.proofs.bulkPut(seed.proofs);
+    },
+  );
 }
 
 /** 首次打开时写入示例档案；已有数据则跳过。并发调用共享同一个 Promise。 */

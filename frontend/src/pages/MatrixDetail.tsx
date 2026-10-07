@@ -18,6 +18,8 @@ import {
 } from '../types/matrix';
 import { CLARITY_LEVELS, IMPRESSION_RANGE, PRESSURE_RANGE } from '../types/proof';
 import type { ClarityLevel } from '../types/proof';
+import { proofStandardKey } from '../types/proofStandard';
+import { evaluateProof, standardsMap } from '../utils/proofJudge';
 import { pinyinOf, radicalOf, strokesOf } from '../utils/charIndex';
 import { dash, formatDate, formatStamp, suggestSampleNo, todayStr } from '../utils/format';
 import { rcKey } from '../utils/layout';
@@ -46,6 +48,8 @@ export default function MatrixDetail() {
   const updateMatrix = useMatrixStore((s) => s.updateMatrix);
   const addDefect = useMatrixStore((s) => s.addDefect);
   const addProof = useMatrixStore((s) => s.addProof);
+  const archiveProof = useMatrixStore((s) => s.archiveProof);
+  const standards = useMatrixStore((s) => s.standards);
   const repairMatrix = useMatrixStore((s) => s.repairMatrix);
   const removeMatrix = useMatrixStore((s) => s.removeMatrix);
   const cases = useCaseStore((s) => s.cases);
@@ -88,6 +92,42 @@ export default function MatrixDetail() {
     note: '',
   });
   const [proofErrors, setProofErrors] = useState<Record<string, string>>({});
+
+  /** 该字模字体 / 字号对应的现行试印标准（没有则本组试印一律未定标） */
+  const linkedStandard = useMemo(
+    () => (matrix ? standardsMap(standards).get(proofStandardKey(matrix)) : undefined),
+    [matrix, standards],
+  );
+
+  /** 就地新增试印表单的实时预判 */
+  const proofPreview = useMemo(() => {
+    if (!matrix) return null;
+    const pressure = Number(proofForm.pressureKg);
+    const impressions = Number(proofForm.impressions);
+    if (!Number.isFinite(pressure) || !Number.isInteger(impressions)) return null;
+    return evaluateProof(
+      {
+        targetKind: '字符',
+        matrixId: matrix.id,
+        pressureKg: pressure,
+        ink: proofForm.ink,
+        impressions,
+        proofDate: proofForm.proofDate,
+      },
+      matrix,
+      standardsMap(standards),
+      'live',
+    );
+  }, [matrix, proofForm, standards]);
+
+  const verdictStyle = (verdict: string) =>
+    verdict === '达标'
+      ? 'border-jade/40 text-jade'
+      : verdict === '偏淡'
+        ? 'border-brass/40 text-brass'
+        : verdict === '糊版'
+          ? 'border-seal/40 text-seal'
+          : 'border-ink-mute/40 text-ink-mute';
 
   if (!matrix) {
     return (
@@ -197,6 +237,11 @@ export default function MatrixDetail() {
       sampleNo: suggestSampleNo(todayStr(), matrixProofs.length + 2),
       note: '',
     }));
+  };
+
+  const handleArchiveProof = async (proofId: string, sampleNo: string, verdict: string) => {
+    await archiveProof(proofId);
+    pushToast(`样张 ${sampleNo} 已留档，判定冻结为「${verdict}」，之后改标准不再重算`);
   };
 
   const handleRepair = async () => {
@@ -532,12 +577,37 @@ export default function MatrixDetail() {
                 <li key={p.id} className="space-y-1 px-4 py-3" data-testid={`proof-item-${p.id}`}>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-ink-soft">
                     <span className="font-song text-sm text-ink">{p.sampleNo}</span>
-                    <span className="mt-chip">{p.clarity}</span>
+                    <span className={`mt-chip ${verdictStyle(p.verdict)}`} data-testid={`proof-verdict-${p.id}`}>
+                      {p.verdict}
+                    </span>
+                    <span className="text-ink-mute">观察：{p.clarity}</span>
                     <span className="text-ink-mute">{formatDate(p.proofDate)}</span>
+                    {p.archived ? (
+                      <span className="mt-chip border-jade/40 text-jade" data-testid={`proof-archived-${p.id}`}>
+                        已留档 · 判定冻结
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="mt-btn mt-btn-ghost"
+                        data-testid={`archive-proof-${p.id}`}
+                        onClick={() => void handleArchiveProof(p.id, p.sampleNo, p.verdict)}
+                      >
+                        留档
+                      </button>
+                    )}
                   </div>
                   <p className="text-xs text-ink-soft">
                     压力 {p.pressureKg} kg · 用墨 {p.ink} · 印次 {p.impressions}
                   </p>
+                  <p className="text-[11px] text-ink-mute" data-testid={`proof-standard-${p.id}`}>
+                    {p.verdict === '未定标'
+                      ? '判定依据：未定标（当时没有该字体 / 字号的生效标准）'
+                      : `判定依据：${p.standardKey.replace('|', ' / ')} v${p.standardVersion}（${p.standardPressureMinKg}–${p.standardPressureMaxKg}kg · ${p.standardInk} · ≥${p.standardMinImpressions}印）`}
+                  </p>
+                  {p.judgeReasons.length > 0 ? (
+                    <p className="text-[11px] text-ink-mute">{p.judgeReasons.join('；')}</p>
+                  ) : null}
                   {p.note ? <p className="text-[11px] text-ink-mute">备注：{p.note}</p> : null}
                 </li>
               ))
@@ -545,6 +615,16 @@ export default function MatrixDetail() {
           </ul>
           <form className="space-y-3 border-t border-paper-line px-4 py-3" onSubmit={handleAddProof} data-testid="inline-proof-form">
             <h4 className="font-song text-sm font-semibold text-ink">就地新增试印</h4>
+            {linkedStandard ? (
+              <p className="text-[11px] text-ink-mute" data-testid="inline-proof-standard">
+                现行标准（{linkedStandard.font} / {linkedStandard.sizeName} v{linkedStandard.version}）：
+                压力 {linkedStandard.pressureMinKg}–{linkedStandard.pressureMaxKg}kg · {linkedStandard.ink} · 不少于 {linkedStandard.minImpressions} 印次
+              </p>
+            ) : (
+              <p className="text-[11px] text-seal" data-testid="inline-proof-no-standard">
+                该字体 / 字号尚无试印标准，本次登记将判为「未定标」。
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="mt-label" htmlFor="inline-proof-pressure">
@@ -637,6 +717,18 @@ export default function MatrixDetail() {
                 />
               </div>
             </div>
+            {proofPreview ? (
+              <div
+                className="flex flex-wrap items-center gap-2 rounded border border-paper-line bg-paper/50 px-3 py-2"
+                data-testid="inline-proof-preview"
+              >
+                <span className="text-[11px] text-ink-mute">按现行标准预判：</span>
+                <span className={`mt-chip ${verdictStyle(proofPreview.verdict)}`} data-testid="inline-proof-preview-verdict">
+                  {proofPreview.verdict}
+                </span>
+                <span className="text-[11px] text-ink-soft">{proofPreview.judgeReasons.join('；')}</span>
+              </div>
+            ) : null}
             <button type="submit" className="mt-btn mt-btn-primary" data-testid="inline-proof-submit">
               登记试印
             </button>

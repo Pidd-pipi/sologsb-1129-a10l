@@ -5,12 +5,26 @@ import { shouldDisableMatrix } from '../types/defect';
 import type { MatrixInput, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofInput, ProofRecord } from '../types/proof';
+import type { ProofStandard, ProofStandardInput } from '../types/proofStandard';
+import { standardKeyOf } from '../types/proofStandard';
+import { evaluateProof, standardsMap } from '../utils/proofJudge';
 import { makeId, toPlain, todayStr } from '../utils/format';
+
+/** 晚保存者提交时标准已被他人改动：携带库里现行值与逐字段差异，先看差异再决定入库 */
+export class StandardConflictError extends Error {
+  current: ProofStandard;
+  constructor(current: ProofStandard) {
+    super('试印工艺标准已被他人修改');
+    this.name = 'StandardConflictError';
+    this.current = current;
+  }
+}
 
 interface MatrixState {
   matrices: TypeMatrix[];
   defects: DefectLog[];
   proofs: ProofRecord[];
+  standards: ProofStandard[];
   loaded: boolean;
   loading: boolean;
   error: string;
@@ -21,14 +35,25 @@ interface MatrixState {
   addDefect: (input: DefectInput) => Promise<DefectLog>;
   repairMatrix: (matrixId: string, operator: string) => Promise<void>;
   addProof: (input: ProofInput) => Promise<ProofRecord>;
+  archiveProof: (id: string) => Promise<void>;
+  refreshStandards: () => Promise<void>;
+  saveStandard: (
+    input: ProofStandardInput,
+    id?: string,
+    baseVersion?: number,
+    force?: boolean,
+  ) => Promise<ProofStandard>;
 }
 
 const byUpdatedDesc = (a: TypeMatrix, b: TypeMatrix) => (a.updatedAt < b.updatedAt ? 1 : -1);
+const byStdKey = (a: ProofStandard, b: ProofStandard) =>
+  standardKeyOf(a) < standardKeyOf(b) ? -1 : standardKeyOf(a) > standardKeyOf(b) ? 1 : 0;
 
 export const useMatrixStore = create<MatrixState>((set, get) => ({
   matrices: [],
   defects: [],
   proofs: [],
+  standards: [],
   loaded: false,
   loading: false,
   error: '',
@@ -38,15 +63,17 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
     set({ loading: true, error: '' });
     try {
       await ensureSeed();
-      const [matrices, defects, proofs] = await Promise.all([
+      const [matrices, defects, proofs, standards] = await Promise.all([
         db.matrices.toArray(),
         db.defects.toArray(),
         db.proofs.toArray(),
+        db.standards.toArray(),
       ]);
       set({
         matrices: matrices.sort(byUpdatedDesc),
         defects,
         proofs,
+        standards: standards.sort(byStdKey),
         loaded: true,
         loading: false,
       });
@@ -161,8 +188,7 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
 
   addProof: async (input) => {
     const matrix = input.matrixId ? get().matrices.find((m) => m.id === input.matrixId) : undefined;
-    const row: ProofRecord = toPlain({
-      id: makeId('pfr'),
+    const base = {
       targetKind: input.targetKind,
       targetRef: input.targetRef.trim(),
       matrixId: input.matrixId,
@@ -173,11 +199,126 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
       clarity: input.clarity,
       proofDate: input.proofDate || todayStr(),
       note: (input.note ?? '').trim(),
+    };
+    if (matrix && input.targetKind === '字符' && !base.targetRef) base.targetRef = matrix.character;
+    // 登记即按现行（=试印当时）标准判定，快照随记录一起落库
+    const evaluation = evaluateProof(base, matrix, standardsMap(get().standards), 'live');
+    const row: ProofRecord = toPlain({
+      id: makeId('pfr'),
+      ...base,
+      ...evaluation,
+      judgedAt: new Date().toISOString(),
+      archived: false,
+      archivedAt: '',
       createdAt: new Date().toISOString(),
     });
-    if (matrix && input.targetKind === '字符' && !row.targetRef) row.targetRef = matrix.character;
     await db.proofs.add(row);
     set((s) => ({ proofs: [row, ...s.proofs] }));
+    return row;
+  },
+
+  /** 留档样张：判定冻结在此刻，之后标准改动不再倒推它 */
+  archiveProof: async (id) => {
+    const archivedAt = new Date().toISOString();
+    await db.proofs.update(id, { archived: true, archivedAt });
+    set((s) => ({
+      proofs: s.proofs.map((p) => (p.id === id ? { ...p, archived: true, archivedAt } : p)),
+    }));
+  },
+
+  /** 多标签页 / 他人改过后，重新读取标准（晚保存者据此发现版本已变） */
+  refreshStandards: async () => {
+    const standards = (await db.standards.toArray()).sort(byStdKey);
+    set({ standards });
+  },
+
+  /**
+   * 保存标准（新增或修改）。
+   * 乐观并发：修改时带上打开表单时的 version；库里版本已更新则抛 StandardConflictError，
+   * 由页面提示「标准已变过」并展示差异，不入库。force=true 表示已看过差异仍以编辑稿入库。
+   * 入库后同一事务内重算所有「未留档」试印；已留档样张保持当时判定，不倒推。
+   */
+  saveStandard: async (input, id, baseVersion, force = false) => {
+    const now = new Date().toISOString();
+    let saved: ProofStandard | null = null;
+    const changedProofs: ProofRecord[] = [];
+    await db.transaction(
+      'rw',
+      db.standards,
+      db.proofs,
+      db.matrices,
+      async () => {
+        const keyOfInput = `${input.font}|${input.sizeName}`;
+        const existing = id ? await db.standards.get(id) : undefined;
+        if (id && !existing) throw new Error('要修改的标准已不存在，请刷新后重试');
+
+        // 同分组唯一：新增时（或修改时改了字体/字号）不能与别的标准撞键
+        const sameKey = (await db.standards.toArray()).find(
+          (s) => standardKeyOf(s) === keyOfInput && s.id !== id,
+        );
+        if (sameKey) throw new Error(`「${input.font} / ${input.sizeName}」已有标准，请直接修改原标准`);
+
+        if (existing && baseVersion !== undefined && existing.version !== baseVersion && !force) {
+          throw new StandardConflictError(existing);
+        }
+
+        const version = existing ? existing.version + 1 : 1;
+        const row: ProofStandard = toPlain({
+          id: existing ? existing.id : makeId('std'),
+          font: input.font,
+          sizeName: input.sizeName,
+          pressureMinKg: Number(input.pressureMinKg),
+          pressureMaxKg: Number(input.pressureMaxKg),
+          ink: input.ink.trim(),
+          minImpressions: Number(input.minImpressions),
+          note: (input.note ?? '').trim(),
+          version,
+          createdAt: existing ? existing.createdAt : now,
+          updatedAt: now,
+        });
+        await db.standards.put(row);
+        saved = row;
+
+        // 标准一改，没归档的试印跟着重算（按试印当时视角：仍按这组字体/字号匹配）
+        const allStandards = await db.standards.toArray();
+        const byKey = standardsMap(allStandards);
+        const matrices: TypeMatrix[] = await db.matrices.toArray();
+        const matrixById = new Map(matrices.map((m) => [m.id, m]));
+        const openProofs = await db.proofs.filter((p) => !p.archived).toArray();
+        for (const p of openProofs) {
+          const evaluation = evaluateProof(
+            p,
+            p.matrixId ? matrixById.get(p.matrixId) : undefined,
+            byKey,
+            'live',
+          );
+          const changed =
+            p.verdict !== evaluation.verdict ||
+            p.standardId !== evaluation.standardId ||
+            p.standardVersion !== evaluation.standardVersion;
+          if (!changed) continue;
+          const updated: ProofRecord = {
+            ...p,
+            ...toPlain(evaluation),
+            judgedAt: now,
+          };
+          await db.proofs.put(updated);
+          changedProofs.push(updated);
+        }
+      },
+    );
+
+    const row = saved!;
+    set((s) => {
+      const changedById = new Map(changedProofs.map((p) => [p.id, p]));
+      return {
+        standards: s.standards
+          .filter((x) => x.id !== row.id)
+          .concat(row)
+          .sort(byStdKey),
+        proofs: s.proofs.map((p) => changedById.get(p.id) ?? p),
+      };
+    });
     return row;
   },
 }));

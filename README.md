@@ -31,22 +31,32 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 | 本地存储 | IndexedDB（Dexie，库名 `gbmovabletype-db`）+ localStorage（表单 / 布局草稿） |
 | 部署 | 多阶段 Docker：`node:20-alpine` 构建 → `nginx:alpine` 托管静态产物 |
 
-## 数据模型（`src/types/` 四个独立文件）
+## 数据模型（`src/types/` 五个独立文件）
 
 | 模型 | 文件 | 关键字段 |
 | --- | --- | --- |
 | TypeMatrix 字模 | `src/types/matrix.ts` | 字模编号、字符、字体（宋体/楷体/仿宋）、字号（初号 42pt … 八号 5pt 共 16 档）、材质（铜模/木活字/铅合金）、字面尺寸 mm、字身高度 mm、制作年代、刻工、可用性 |
 | TypeCase 字盘 | `src/types/case.ts` | 字盘编号、类型（常用字盘/生僻字盘）、行数、列数、格位布局（行/列/字符/字模 id）、所在工位、容量 |
 | DefectLog 缺损记录 | `src/types/defect.ts` | 字模 id、缺损类型（缺笔/磨损/变形/锈蚀/断裂）、程度（轻/中/重）、发现日期、处理方式、可用性（可用/停用/待补刻） |
-| ProofRecord 试印记录 | `src/types/proof.ts` | 字符或字盘、压力 kg、用墨、印次、样张编号、清晰度评价（清晰/偏淡/糊版）、试印日期 |
+| ProofRecord 试印记录 | `src/types/proof.ts` | 字符或字盘、压力 kg、用墨、印次、样张编号、人工观察清晰度、**工艺判定 verdict（达标/偏淡/糊版/未定标）与判定原因**、判定依据的**标准快照**（标准 id/版本/字体字号/推荐值）、判定时间、**是否已留档**及留档时间、试印日期 |
+| ProofStandard 试印工艺标准 | `src/types/proofStandard.ts` | 字体 + 字号唯一分组、推荐压力区间、推荐用墨、最少印次、版本号（每次保存自增）、备注 |
+
+### 试印判定规则
+
+- 标准按「字体 + 字号」登记；登记试印时按关联字模匹配现行标准实时预判并落定判定，同时把标准内容复制成**快照**存在试印记录上，展示一律读快照。
+- 压力高于推荐上限 → **糊版**；压力低于下限、印次少于最少印次、用墨与推荐不符 → **偏淡**；全部落在推荐范围内 → **达标**；该字体/字号没有标准（含整盘试印）→ **未定标**。
+- 标准一改，所有**未留档**试印在同一事务内按新标重算；**已留档**样张的判定与快照一起冻结，不会被倒推改掉。
+- 两人同时改同一条标准时用版本号做乐观并发：晚保存的一方收到「标准已变过」提示，先看逐字段差异，再决定放弃修改或强制入库。
+- 旧人工填写的「清晰度」保留为观察值，与标准判定并列展示，二者可以不一致。
 
 ### IndexedDB 版本与升级迁移（Dexie）
 
 - **v1**：建 `matrices` 表（含 code / character / font / sizeName / material / availability 索引）
 - **v2**：加 `cases` 表与 `matrixId` 多值索引；升级时按 `slots` 回填历史字盘的 `matrixId`
 - **v3**：加 `defects`、`proofs` 表；升级时为「停用 / 待补刻」的历史字模回填缺损原因记录
+- **v4**：加 `standards` 表（`&[font+sizeName]` 唯一、`version` 版本）；老库升级先写入内置标准，再按**试印日期匹配当时标准**为旧试印补判与快照，找不到适用标准（含整盘试印）一律标成**未定标**并注明「旧数据升级补判」
 
-首次打开且库为空时会写入一批示例档案（16 枚字模、2 个字盘、5 条缺损、6 条试印），便于直接体验；已有数据则跳过。
+首次打开且库为空时会写入一批示例档案（16 枚字模、2 个字盘、5 条缺损、9 条试印工艺标准、6 条试印），便于直接体验；已有数据则跳过。
 
 ## 页面与路由
 
@@ -57,7 +67,8 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 | `/matrices/:id` | `MatrixDetail` | 字模详情：字面信息、所在字盘格位、缺损历史、试印记录，可就地新增缺损或试印、补刻恢复可用 |
 | `/cases` | `CaseEditor` | 字盘布局编辑器：行列网格点击落位 / 取出 / 调换，实时提示空格与重复落位 |
 | `/defects` | `DefectBoard` | 缺损登记：提交后自动停用字模并进入待补刻清单，补刻完成一键恢复 |
-| `/proofs` | `ProofList` | 试印记录：登记压力、用墨与清晰度，按样张编号回溯试印批次 |
+| `/proofs` | `ProofList` | 试印记录：登记压力、用墨与印次后按工艺标准判达标 / 偏淡 / 糊版（无标准判未定标），保留人工观察清晰度；可将样张留档冻结判定，按样张编号回溯试印批次 |
+| `/standards` | `ProofStandards` | 试印工艺标准：按字体 / 字号登记推荐压力区间、用墨与最少印次；保存即升版本并触发未归档试印重算；两人同时修改时晚保存者先看字段差异再决定入库 |
 
 ## 目录结构
 
@@ -74,20 +85,20 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
     ├── tailwind.config.js / postcss.config.js / vite.config.ts
     ├── public/favicon.svg
     └── src/
-        ├── types/{matrix,case,defect,proof}.ts
-        ├── db/index.ts       # Dexie 库、版本迁移、示例档案
+        ├── types/{matrix,case,defect,proof,proofStandard}.ts
+        ├── db/index.ts       # Dexie 库、版本迁移、示例档案与内置标准
         ├── stores/{matrixStore,caseStore,uiStore}.ts
         ├── hooks/{useMatrixSearch,useLocalDraft,useCaseSlots}.ts
         ├── components/common/{MatrixCell,LayoutGrid,CharacterPicker,DefectBadge,EmptyState}.tsx
         ├── layouts/AppShell.tsx
-        ├── pages/{Overview,MatrixNew,MatrixDetail,CaseEditor,DefectBoard,ProofList}.tsx
+        ├── pages/{Overview,MatrixNew,MatrixDetail,CaseEditor,DefectBoard,ProofList,ProofStandards}.tsx
         ├── router/index.tsx
-        └── utils/{charIndex,layout,format}.ts
+        └── utils/{charIndex,layout,format,proofJudge}.ts
 ```
 
 ## 数据存储说明
 
-- **业务数据**：IndexedDB（Dexie，库名 `gbmovabletype-db`，共 4 张表 `matrices` / `cases` / `defects` / `proofs`）。写入前统一 `toPlain()` 深拷贝，避免响应式对象写库抛 `DataCloneError`。
+- **业务数据**：IndexedDB（Dexie，库名 `gbmovabletype-db`，共 5 张表 `matrices` / `cases` / `defects` / `proofs` / `standards`）。写入前统一 `toPlain()` 深拷贝，避免响应式对象写库抛 `DataCloneError`。
 - **草稿数据**：localStorage，前缀 `gbmovabletype-draft:`，覆盖字模登记、字盘布局、缺损登记、试印登记四处表单，刷新后可恢复。
 - **界面偏好**：localStorage，键 `gbmovabletype-ui`（Zustand persist，保存筛选条件与当前选中字盘）。
 - 容器完全无状态：不挂载命名卷、不连接数据库服务，删除重建容器不影响浏览器里的档案。
