@@ -5,12 +5,15 @@ import { shouldDisableMatrix } from '../types/defect';
 import type { MatrixInput, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofInput, ProofRecord } from '../types/proof';
+import type { ProofStandard, ProofStandardInput } from '../types/standard';
+import { judgeProofByStandard, standardAtDate, StandardConflictError } from '../types/standard';
 import { makeId, toPlain, todayStr } from '../utils/format';
 
 interface MatrixState {
   matrices: TypeMatrix[];
   defects: DefectLog[];
   proofs: ProofRecord[];
+  standards: ProofStandard[];
   loaded: boolean;
   loading: boolean;
   error: string;
@@ -21,6 +24,17 @@ interface MatrixState {
   addDefect: (input: DefectInput) => Promise<DefectLog>;
   repairMatrix: (matrixId: string, operator: string) => Promise<void>;
   addProof: (input: ProofInput) => Promise<ProofRecord>;
+  /** 留档 / 取消留档：留档后判定冻结，标准改动不再倒推 */
+  toggleProofArchived: (id: string, archived: boolean) => Promise<void>;
+  /**
+   * 保存工艺标准（新增一个版本）。baseVersion 为表单载入时基于的版本，
+   * 库中最新版本不一致时抛 StandardConflictError（两人同时修改的晚保存方）。
+   * 保存成功后未归档的同字体字号试印按新标准重算。
+   */
+  saveStandard: (
+    input: ProofStandardInput,
+    baseVersion: number,
+  ) => Promise<{ standard: ProofStandard; recalculated: number }>;
 }
 
 const byUpdatedDesc = (a: TypeMatrix, b: TypeMatrix) => (a.updatedAt < b.updatedAt ? 1 : -1);
@@ -29,6 +43,7 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
   matrices: [],
   defects: [],
   proofs: [],
+  standards: [],
   loaded: false,
   loading: false,
   error: '',
@@ -38,15 +53,17 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
     set({ loading: true, error: '' });
     try {
       await ensureSeed();
-      const [matrices, defects, proofs] = await Promise.all([
+      const [matrices, defects, proofs, standards] = await Promise.all([
         db.matrices.toArray(),
         db.defects.toArray(),
         db.proofs.toArray(),
+        db.proofStandards.toArray(),
       ]);
       set({
         matrices: matrices.sort(byUpdatedDesc),
         defects,
         proofs,
+        standards,
         loaded: true,
         loading: false,
       });
@@ -161,24 +178,102 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
 
   addProof: async (input) => {
     const matrix = input.matrixId ? get().matrices.find((m) => m.id === input.matrixId) : undefined;
+    const now = new Date().toISOString();
+    const proofDate = input.proofDate || todayStr();
+    // 按试印日期匹配当时生效的标准判定；找不到适用标准记未定标
+    const std = standardAtDate(get().standards, input.font, input.sizeName, proofDate);
     const row: ProofRecord = toPlain({
       id: makeId('pfr'),
       targetKind: input.targetKind,
       targetRef: input.targetRef.trim(),
       matrixId: input.matrixId,
+      font: input.font,
+      sizeName: input.sizeName,
       pressureKg: Number(input.pressureKg),
       ink: input.ink.trim(),
       impressions: Number(input.impressions),
       sampleNo: input.sampleNo.trim(),
       clarity: input.clarity,
-      proofDate: input.proofDate || todayStr(),
+      verdict: std ? judgeProofByStandard({ pressureKg: Number(input.pressureKg), ink: input.ink, impressions: Number(input.impressions) }, std) : ('未定标' as const),
+      standardId: std?.id ?? '',
+      standardVersion: std?.version ?? 0,
+      judgedAt: now,
+      archived: false,
+      proofDate,
       note: (input.note ?? '').trim(),
-      createdAt: new Date().toISOString(),
+      createdAt: now,
     });
     if (matrix && input.targetKind === '字符' && !row.targetRef) row.targetRef = matrix.character;
     await db.proofs.add(row);
     set((s) => ({ proofs: [row, ...s.proofs] }));
     return row;
+  },
+
+  toggleProofArchived: async (id, archived) => {
+    await db.proofs.update(id, { archived });
+    set((s) => ({
+      proofs: s.proofs.map((p) => (p.id === id ? { ...p, archived } : p)),
+    }));
+  },
+
+  saveStandard: async (input, baseVersion) => {
+    const now = new Date().toISOString();
+    const result = await db.transaction('rw', db.proofStandards, db.proofs, async () => {
+      const versions = await db.proofStandards
+        .where('[font+sizeName]')
+        .equals([input.font, input.sizeName])
+        .toArray();
+      const latest = versions.sort((a, b) => b.version - a.version)[0];
+      const latestVersion = latest?.version ?? 0;
+      // 乐观锁：表单基于的版本已被他人推进时拒绝入库，交由页面展示差异
+      if (latestVersion !== baseVersion) throw new StandardConflictError(latest);
+      const row: ProofStandard = toPlain({
+        id: makeId('std'),
+        font: input.font,
+        sizeName: input.sizeName,
+        pressureMinKg: Number(input.pressureMinKg),
+        pressureMaxKg: Number(input.pressureMaxKg),
+        ink: input.ink.trim(),
+        minImpressions: Number(input.minImpressions),
+        effectiveDate: input.effectiveDate,
+        version: latestVersion + 1,
+        updatedBy: input.updatedBy.trim(),
+        note: (input.note ?? '').trim(),
+        createdAt: now,
+      });
+      await db.proofStandards.add(row);
+      // 标准一改动，未归档的同字体字号试印跟着按新标准重算；已留档样张保持当时判定
+      const unarchived = (await db.proofs.toArray()).filter(
+        (p) => !p.archived && p.font === row.font && p.sizeName === row.sizeName,
+      );
+      let recalculated = 0;
+      const patched: ProofRecord[] = [];
+      for (const p of unarchived) {
+        const verdict = judgeProofByStandard(p, row);
+        if (verdict === p.verdict && p.standardId === row.id) continue;
+        const next: ProofRecord = {
+          ...p,
+          verdict,
+          standardId: row.id,
+          standardVersion: row.version,
+          judgedAt: now,
+        };
+        await db.proofs.update(p.id, {
+          verdict,
+          standardId: row.id,
+          standardVersion: row.version,
+          judgedAt: now,
+        });
+        patched.push(next);
+        recalculated += 1;
+      }
+      return { row, patched, recalculated };
+    });
+    set((s) => ({
+      standards: [...s.standards, result.row],
+      proofs: s.proofs.map((p) => result.patched.find((q) => q.id === p.id) ?? p),
+    }));
+    return { standard: result.row, recalculated: result.recalculated };
   },
 }));
 

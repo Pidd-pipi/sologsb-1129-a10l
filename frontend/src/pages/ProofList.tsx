@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import EmptyState from '../components/common/EmptyState';
+import VerdictBadge from '../components/common/VerdictBadge';
 import { DRAFT_KEYS, useLocalDraft } from '../hooks/useLocalDraft';
 import { useMatrixStore } from '../stores/matrixStore';
 import { useUiStore } from '../stores/uiStore';
+import { MATRIX_FONTS, MATRIX_SIZE_NAMES, type MatrixFont } from '../types/matrix';
 import {
   CLARITY_LEVELS,
   IMPRESSION_RANGE,
@@ -14,12 +16,15 @@ import {
   type ProofInput,
   type ProofTargetKind,
 } from '../types/proof';
+import { judgeProofByStandard, standardAtDate } from '../types/standard';
 import { dash, formatDate, suggestSampleNo, todayStr } from '../utils/format';
 
 interface ProofFormState {
   targetKind: ProofTargetKind;
   matrixId: string;
   targetRef: string;
+  font: MatrixFont | '';
+  sizeName: string;
   pressureKg: string;
   ink: string;
   impressions: string;
@@ -29,12 +34,14 @@ interface ProofFormState {
   note: string;
 }
 
-/** `/proofs` 试印记录：登记压力、用墨与清晰度评价，按样张编号回溯试印批次 */
+/** `/proofs` 试印记录：登记压力、用墨与清晰度，对照工艺标准判定达标 / 偏淡 / 糊版，可留档冻结判定 */
 export default function ProofList() {
   const matrices = useMatrixStore((s) => s.matrices);
   const proofs = useMatrixStore((s) => s.proofs);
+  const standards = useMatrixStore((s) => s.standards);
   const proofCount = useMatrixStore((s) => s.proofs.length);
   const addProof = useMatrixStore((s) => s.addProof);
+  const toggleProofArchived = useMatrixStore((s) => s.toggleProofArchived);
   const pushToast = useUiStore((s) => s.pushToast);
   const sampleQuery = useUiStore((s) => s.sampleQuery);
   const setSampleQuery = useUiStore((s) => s.setSampleQuery);
@@ -45,6 +52,8 @@ export default function ProofList() {
       targetKind: '字符',
       matrixId: '',
       targetRef: '',
+      font: '宋体',
+      sizeName: '五号',
       pressureKg: '12.5',
       ink: '油烟墨 101',
       impressions: '40',
@@ -64,9 +73,26 @@ export default function ProofList() {
 
   useEffect(() => {
     if (draft.targetKind === '字符' && selectedMatrix) {
-      patch({ targetRef: selectedMatrix.character });
+      patch({
+        targetRef: selectedMatrix.character,
+        font: selectedMatrix.font,
+        sizeName: selectedMatrix.sizeName,
+      });
     }
   }, [draft.targetKind, selectedMatrix, patch]);
+
+  /** 按试印日期匹配当时生效的标准；登记前实时给出预判 */
+  const matchedStandard = useMemo(
+    () => standardAtDate(standards, draft.font, draft.sizeName, draft.proofDate),
+    [standards, draft.font, draft.sizeName, draft.proofDate],
+  );
+  const previewVerdict = useMemo(() => {
+    if (!matchedStandard) return '未定标' as const;
+    const p = Number(draft.pressureKg);
+    const n = Number(draft.impressions);
+    if (!Number.isFinite(p) || !Number.isInteger(n)) return '未定标' as const;
+    return judgeProofByStandard({ pressureKg: p, ink: draft.ink, impressions: n }, matchedStandard);
+  }, [matchedStandard, draft.pressureKg, draft.ink, draft.impressions]);
 
   const traced = useMemo(() => {
     const q = sampleQuery.trim().toLowerCase();
@@ -84,12 +110,22 @@ export default function ProofList() {
     return out;
   }, [proofs]);
 
+  const verdictStats = useMemo(() => {
+    const out: Record<string, number> = {};
+    proofs.forEach((p) => {
+      out[p.verdict] = (out[p.verdict] ?? 0) + 1;
+    });
+    return out;
+  }, [proofs]);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const input: ProofInput = {
       targetKind: draft.targetKind,
       targetRef: draft.targetRef,
       matrixId: draft.targetKind === '字符' ? draft.matrixId : '',
+      font: draft.font,
+      sizeName: draft.sizeName,
       pressureKg: Number(draft.pressureKg),
       ink: draft.ink,
       impressions: Number(draft.impressions),
@@ -104,8 +140,8 @@ export default function ProofList() {
       pushToast('试印登记未通过校验，请按提示修正', 'warn');
       return;
     }
-    await addProof(input);
-    pushToast(`已登记试印样张 ${input.sampleNo}（${input.clarity}）`);
+    const row = await addProof(input);
+    pushToast(`已登记试印样张 ${input.sampleNo}，判定：${row.verdict}`);
     patch({
       note: '',
       sampleNo: suggestSampleNo(todayStr(), proofs.length + 2),
@@ -126,7 +162,7 @@ export default function ProofList() {
             试印记录
           </h2>
           <p className="mt-sub">
-            登记压力（0.5–60 kg）、用墨与清晰度评价，按样张编号回溯试印批次与对应字模。
+            登记压力（0.5–60 kg）、用墨与清晰度，对照工艺标准判定达标 / 偏淡 / 糊版；标准改动后未留档的试印跟着重算。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -136,6 +172,11 @@ export default function ProofList() {
           {CLARITY_LEVELS.map((c) => (
             <span key={c} className="mt-chip">
               {c} {clarityStats[c] ?? 0}
+            </span>
+          ))}
+          {(['达标', '偏淡', '糊版', '未定标'] as const).map((v) => (
+            <span key={v} className="mt-chip" data-testid={`verdict-stat-${v}`}>
+              {v} {verdictStats[v] ?? 0}
             </span>
           ))}
         </div>
@@ -204,6 +245,52 @@ export default function ProofList() {
               {errors.targetRef ? (
                 <p className="mt-error" data-testid="error-targetRef">
                   {errors.targetRef}
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <label className="mt-label" htmlFor="proof-font">
+                判定字体
+              </label>
+              <select
+                id="proof-font"
+                data-testid="proof-font"
+                className="mt-input"
+                value={draft.font}
+                onChange={(e) => patch({ font: e.target.value as MatrixFont })}
+              >
+                {MATRIX_FONTS.map((f) => (
+                  <option key={f} value={f}>
+                    {f}
+                  </option>
+                ))}
+              </select>
+              {errors.font ? (
+                <p className="mt-error" data-testid="error-font">
+                  {errors.font}
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <label className="mt-label" htmlFor="proof-size">
+                判定字号
+              </label>
+              <select
+                id="proof-size"
+                data-testid="proof-size"
+                className="mt-input"
+                value={draft.sizeName}
+                onChange={(e) => patch({ sizeName: e.target.value })}
+              >
+                {MATRIX_SIZE_NAMES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              {errors.sizeName ? (
+                <p className="mt-error" data-testid="error-sizeName">
+                  {errors.sizeName}
                 </p>
               ) : null}
             </div>
@@ -347,6 +434,27 @@ export default function ProofList() {
                 onChange={(e) => patch({ note: e.target.value })}
               />
             </div>
+            <div className="md:col-span-4">
+              {matchedStandard ? (
+                <p
+                  className="rounded border border-paper-line bg-paper/50 px-3 py-2 text-xs text-ink-soft"
+                  data-testid="proof-standard-hint"
+                >
+                  对照标准 v{matchedStandard.version}（{formatDate(matchedStandard.effectiveDate)}{' '}
+                  起生效）：压力 {matchedStandard.pressureMinKg}–{matchedStandard.pressureMaxKg} kg ·
+                  用墨 {matchedStandard.ink} · 印次 ≥{matchedStandard.minImpressions}；当前填写预判：
+                  <span className="font-medium text-ink">{previewVerdict}</span>
+                </p>
+              ) : (
+                <p
+                  className="rounded border border-dashed border-paper-line bg-paper/30 px-3 py-2 text-xs text-ink-mute"
+                  data-testid="proof-standard-hint"
+                >
+                  {draft.font} / {draft.sizeName} 在 {formatDate(draft.proofDate)}{' '}
+                  前没有生效的工艺标准，登记后判定记为「未定标」，可先到「工艺标准」页登记。
+                </p>
+              )}
+            </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button type="submit" className="mt-btn mt-btn-primary" data-testid="submit-proof">
@@ -398,6 +506,12 @@ export default function ProofList() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-song text-sm text-ink">{p.sampleNo}</span>
                     <span className="mt-chip">{p.clarity}</span>
+                    <VerdictBadge
+                      verdict={p.verdict}
+                      standardVersion={p.standardVersion}
+                      archived={p.archived}
+                      testId={`trace-verdict-${p.id}`}
+                    />
                     <span className="text-ink-mute">{formatDate(p.proofDate)}</span>
                     <span className="text-ink-soft">
                       {p.pressureKg} kg · {p.ink} · 印次 {p.impressions}
@@ -431,14 +545,16 @@ export default function ProofList() {
                 <th className="mt-th">压力 / 用墨</th>
                 <th className="mt-th">印次</th>
                 <th className="mt-th">清晰度</th>
+                <th className="mt-th">判定</th>
                 <th className="mt-th">试印日期</th>
                 <th className="mt-th">字模</th>
+                <th className="mt-th">留档</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-paper-line">
               {sortedProofs.length === 0 ? (
                 <tr>
-                  <td className="mt-td text-ink-mute" colSpan={7}>
+                  <td className="mt-td text-ink-mute" colSpan={9}>
                     暂无试印记录。
                   </td>
                 </tr>
@@ -466,6 +582,14 @@ export default function ProofList() {
                         {p.clarity}
                       </span>
                     </td>
+                    <td className="mt-td">
+                      <VerdictBadge
+                        verdict={p.verdict}
+                        standardVersion={p.standardVersion}
+                        archived={p.archived}
+                        testId={`proof-verdict-${p.id}`}
+                      />
+                    </td>
                     <td className="mt-td">{formatDate(p.proofDate)}</td>
                     <td className="mt-td">
                       {p.matrixId ? (
@@ -479,6 +603,23 @@ export default function ProofList() {
                       ) : (
                         '—'
                       )}
+                    </td>
+                    <td className="mt-td">
+                      <button
+                        type="button"
+                        className={`mt-btn ${p.archived ? 'border-jade/40 text-jade' : ''}`}
+                        data-testid={`proof-archive-${p.id}`}
+                        onClick={() => {
+                          void toggleProofArchived(p.id, !p.archived);
+                          pushToast(
+                            p.archived
+                              ? `样张 ${p.sampleNo} 已取消留档，将随标准改动重算`
+                              : `样张 ${p.sampleNo} 已留档，判定冻结不再倒推`,
+                          );
+                        }}
+                      >
+                        {p.archived ? '取消留档' : '留档'}
+                      </button>
                     </td>
                   </tr>
                 ))

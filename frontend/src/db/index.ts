@@ -5,6 +5,8 @@ import type { DefectSeverity, DefectType } from '../types/defect';
 import type { MatrixAvailability, MatrixFont, MatrixMaterial, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofRecord } from '../types/proof';
+import type { ProofStandard } from '../types/standard';
+import { judgeProofByStandard, standardAtDate } from '../types/standard';
 import { matrixIdsOf } from '../utils/layout';
 import { suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
 
@@ -15,12 +17,14 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 加 proofStandards 表；旧试印按试印日期匹配当时标准回填判定，匹配不到记未定标
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
   cases!: Table<TypeCase, string>;
   defects!: Table<DefectLog, string>;
   proofs!: Table<ProofRecord, string>;
+  proofStandards!: Table<ProofStandard, string>;
 
   constructor() {
     super(DB_NAME);
@@ -75,6 +79,43 @@ class MovableTypeDb extends Dexie {
             operator: '系统迁移',
             note: '由 v2 → v3 升级自动回填',
             createdAt: new Date().toISOString(),
+          });
+        }
+      });
+    this.version(4)
+      .stores({
+        matrices: 'id, code, character, font, sizeName, material, availability',
+        cases: 'id, code, kind, workStation, *matrixId',
+        defects: 'id, matrixId, defectType, severity, availability, foundDate',
+        proofs: 'id, matrixId, sampleNo, clarity, proofDate, verdict',
+        proofStandards: 'id, version, effectiveDate, [font+sizeName]',
+      })
+      .upgrade(async (tx) => {
+        // v4：旧库没有工艺标准，先补默认标准（生效日期早于历史试印），再按试印日期回填判定
+        const stdTable = tx.table('proofStandards');
+        if ((await stdTable.count()) === 0) {
+          await stdTable.bulkAdd(toPlain(buildSeedStandards()));
+        }
+        const standards: ProofStandard[] = await stdTable.toArray();
+        const matrices: TypeMatrix[] = await tx.table('matrices').toArray();
+        const matrixById = new Map(matrices.map((m) => [m.id, m]));
+        const proofs: Array<Partial<ProofRecord> & { id: string }> = await tx
+          .table('proofs')
+          .toArray();
+        const now = new Date().toISOString();
+        for (const p of proofs) {
+          const matrix = p.matrixId ? matrixById.get(p.matrixId) : undefined;
+          const font = p.font ?? matrix?.font ?? '';
+          const sizeName = p.sizeName ?? matrix?.sizeName ?? '';
+          const std = standardAtDate(standards, font, sizeName, p.proofDate ?? '');
+          await tx.table('proofs').update(p.id, {
+            font,
+            sizeName,
+            archived: p.archived ?? false,
+            verdict: std ? judgeProofByStandard(p as ProofRecord, std) : '未定标',
+            standardId: std?.id ?? '',
+            standardVersion: std?.version ?? 0,
+            judgedAt: now,
           });
         }
       });
@@ -169,23 +210,68 @@ interface SeedProof {
   targetKind: '字符' | '字盘';
   targetRef: string;
   matrixId: string;
+  font: MatrixFont | '';
+  sizeName: string;
   pressureKg: number;
   ink: string;
   impressions: number;
   sampleNo: string;
   clarity: '清晰' | '偏淡' | '糊版';
   proofDate: string;
+  archived?: boolean;
   note: string;
 }
 
 const SEED_PROOFS: SeedProof[] = [
-  { id: 'pfr-3001', targetKind: '字符', targetRef: '活', matrixId: 'm-1001', pressureKg: 12.5, ink: '油烟墨 101', impressions: 40, sampleNo: 'YZ-20250512-01', clarity: '清晰', proofDate: '2025-05-12', note: '字口饱满，留作标准样张' },
-  { id: 'pfr-3002', targetKind: '字符', targetRef: '字', matrixId: 'm-1002', pressureKg: 10, ink: '松烟墨 08', impressions: 32, sampleNo: 'YZ-20250512-02', clarity: '偏淡', proofDate: '2025-05-12', note: '压力偏低，建议加压至 12kg' },
-  { id: 'pfr-3003', targetKind: '字符', targetRef: '墨', matrixId: 'm-1011', pressureKg: 14, ink: '油烟墨 101', impressions: 25, sampleNo: 'YZ-20250513-01', clarity: '糊版', proofDate: '2025-05-13', note: '缺笔叠加糊版，判定停用' },
-  { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
-  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
-  { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
+  { id: 'pfr-3001', targetKind: '字符', targetRef: '活', matrixId: 'm-1001', font: '宋体', sizeName: '初号', pressureKg: 12.5, ink: '油烟墨 101', impressions: 40, sampleNo: 'YZ-20250512-01', clarity: '清晰', proofDate: '2025-05-12', archived: true, note: '字口饱满，留作标准样张' },
+  { id: 'pfr-3002', targetKind: '字符', targetRef: '字', matrixId: 'm-1002', font: '宋体', sizeName: '一号', pressureKg: 10, ink: '松烟墨 08', impressions: 32, sampleNo: 'YZ-20250512-02', clarity: '偏淡', proofDate: '2025-05-12', note: '压力偏低，建议加压至 12kg' },
+  { id: 'pfr-3003', targetKind: '字符', targetRef: '墨', matrixId: 'm-1011', font: '宋体', sizeName: '五号', pressureKg: 14, ink: '油烟墨 101', impressions: 25, sampleNo: 'YZ-20250513-01', clarity: '糊版', proofDate: '2025-05-13', note: '缺笔叠加糊版，判定停用' },
+  { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', font: '', sizeName: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
+  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', font: '宋体', sizeName: '小四', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
+  { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', font: '仿宋', sizeName: '小五', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
 ];
+
+interface SeedStandard {
+  id: string;
+  font: MatrixFont;
+  sizeName: string;
+  pressureMinKg: number;
+  pressureMaxKg: number;
+  ink: string;
+  minImpressions: number;
+  effectiveDate: string;
+  updatedBy: string;
+  note: string;
+}
+
+/** 默认工艺标准：新库播种与 v3 → v4 升级共用，生效日期早于示例试印 */
+const SEED_STANDARDS: SeedStandard[] = [
+  { id: 'std-0001', font: '宋体', sizeName: '初号', pressureMinKg: 11, pressureMaxKg: 14, ink: '油烟墨 101', minImpressions: 30, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '大字铜模，压力不足易发虚' },
+  { id: 'std-0002', font: '宋体', sizeName: '一号', pressureMinKg: 11, pressureMaxKg: 13, ink: '油烟墨 101', minImpressions: 30, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '' },
+  { id: 'std-0003', font: '宋体', sizeName: '五号', pressureMinKg: 8, pressureMaxKg: 11, ink: '油烟墨 101', minImpressions: 20, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '小字超压易糊版' },
+  { id: 'std-0004', font: '宋体', sizeName: '小四', pressureMinKg: 9, pressureMaxKg: 12, ink: '油烟墨 101', minImpressions: 24, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '' },
+  { id: 'std-0005', font: '仿宋', sizeName: '小五', pressureMinKg: 8, pressureMaxKg: 10, ink: '松烟墨 08', minImpressions: 40, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '木活字吃墨浅，印次从宽' },
+  { id: 'std-0006', font: '楷体', sizeName: '四号', pressureMinKg: 8, pressureMaxKg: 11, ink: '松烟墨 08', minImpressions: 30, effectiveDate: '2025-01-01', updatedBy: '工艺组', note: '' },
+];
+
+function buildSeedStandards(): ProofStandard[] {
+  const now = new Date().toISOString();
+  return SEED_STANDARDS.map((s) => ({ ...s, version: 1, createdAt: now }));
+}
+
+/** 播种 / 迁移共用：按试印日期匹配当时生效的标准补判定，匹配不到记未定标 */
+function judgeSeedProof(p: SeedProof, standards: ProofStandard[], now: string): ProofRecord {
+  const std = standardAtDate(standards, p.font, p.sizeName, p.proofDate);
+  return {
+    ...p,
+    archived: p.archived ?? false,
+    verdict: std ? judgeProofByStandard(p, std) : '未定标',
+    standardId: std?.id ?? '',
+    standardVersion: std?.version ?? 0,
+    judgedAt: now,
+    createdAt: now,
+  };
+}
 
 function buildSeed() {
   const now = new Date().toISOString();
@@ -232,8 +318,9 @@ function buildSeed() {
       createdAt: now,
     };
   });
-  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => ({ ...p, createdAt: now }));
-  return { matrices, cases, defects, proofs };
+  const proofStandards = buildSeedStandards();
+  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => judgeSeedProof(p, proofStandards, now));
+  return { matrices, cases, defects, proofs, proofStandards };
 }
 
 let seedPromise: Promise<void> | null = null;
@@ -242,11 +329,12 @@ async function doSeed(): Promise<void> {
   const count = await db.matrices.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.matrices, db.cases, db.defects, db.proofs, async () => {
+  await db.transaction('rw', db.matrices, db.cases, db.defects, db.proofs, db.proofStandards, async () => {
     await db.matrices.bulkPut(seed.matrices);
     await db.cases.bulkPut(seed.cases);
     await db.defects.bulkPut(seed.defects);
     await db.proofs.bulkPut(seed.proofs);
+    await db.proofStandards.bulkPut(seed.proofStandards);
   });
 }
 

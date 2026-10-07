@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import DefectBadge from '../components/common/DefectBadge';
 import EmptyState from '../components/common/EmptyState';
+import VerdictBadge from '../components/common/VerdictBadge';
 import LayoutGrid from '../components/common/LayoutGrid';
 import MatrixCell from '../components/common/MatrixCell';
 import { useMatrixStore } from '../stores/matrixStore';
@@ -165,6 +166,8 @@ export default function MatrixDetail() {
       targetKind: '字符' as const,
       targetRef: matrix.character,
       matrixId: matrix.id,
+      font: matrix.font,
+      sizeName: matrix.sizeName,
       pressureKg: Number(proofForm.pressureKg),
       ink: proofForm.ink,
       impressions: Number(proofForm.impressions),
@@ -190,9 +193,8 @@ export default function MatrixDetail() {
       pushToast('试印登记未通过校验，请按提示修正', 'warn');
       return;
     }
-    await addProof(input);
-    pushToast(`已记录试印样张 ${input.sampleNo}`);
-    setProofForm((prev) => ({
+    const saved = await addProof(input);
+    pushToast(`已记录试印样张 ${input.sampleNo}，判定：${saved.verdict}`);    setProofForm((prev) => ({
       ...prev,
       sampleNo: suggestSampleNo(todayStr(), matrixProofs.length + 2),
       note: '',
@@ -533,6 +535,12 @@ export default function MatrixDetail() {
                   <div className="flex flex-wrap items-center gap-2 text-xs text-ink-soft">
                     <span className="font-song text-sm text-ink">{p.sampleNo}</span>
                     <span className="mt-chip">{p.clarity}</span>
+                    <VerdictBadge
+                      verdict={p.verdict}
+                      standardVersion={p.standardVersion}
+                      archived={p.archived}
+                      testId={`detail-proof-verdict-${p.id}`}
+                    />
                     <span className="text-ink-mute">{formatDate(p.proofDate)}</span>
                   </div>
                   <p className="text-xs text-ink-soft">
